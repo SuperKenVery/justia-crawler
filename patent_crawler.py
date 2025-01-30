@@ -87,15 +87,15 @@ def get_all_patents(company: str, session=None) -> Iterator[Patent]:
     if not session:
         session = requests.Session()
         session.headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:134.0) Gecko/20100101 Firefox/134.0"
-    # assert session is not None
+
     page = 1
     base_url = "https://patents.justia.com"
 
     while True:
         tree = etree.HTML(get_page_content(company, page, session))
         patent_nodes = tree.xpath('//li[@class="has-padding-content-block-30 -zb"]')
+
         patents = [Patent(node, base_url=base_url, session=session) for node in patent_nodes]
-        # import pdb; pdb.set_trace()
         yield from patents
 
         next_btn = tree.xpath('//span[@class="pagination page"]/a[text()="next"]')
