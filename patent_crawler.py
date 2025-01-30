@@ -11,6 +11,9 @@ from datetime import datetime, date
 from email import header
 from rich import traceback
 traceback.install(show_locals=True)
+from rich.console import Console
+console = Console()
+from pathlib import Path
 
 class Patent:
     def __init__(self, node, base_url = "", session=requests.Session()):
@@ -18,19 +21,19 @@ class Patent:
         self.session = session
         self.base_url = base_url    # Used in detail_url, don't include trailing slash
 
-    @cached_property
+    @property
     def title(self) -> str:
-        return self.node.xpath('//div[@class="head"]//a/text()')[0]
+        return self.node.xpath('.//div[@class="head"]//a/text()')[0]
 
     @cached_property
     def detail_url(self) -> str:
-        href = self.node.xpath('//div[@class="head"]//a/@href')[0]
+        href = self.node.xpath('.//div[@class="head"]//a/@href')[0]
         # e.g. href = "/patent/12039383"
         return self.base_url + href
 
     @cached_property
     def abstract(self) -> Optional[str]:
-        abstracts = self.node.xpath('//div[@class="meta"]/div[@class="abstract"]/text()[last()]')
+        abstracts = self.node.xpath('.//div[@class="meta"]/div[@class="abstract"]/text()[last()]')
         return abstracts[0] if len(abstracts)>0 else None
 
     @staticmethod
@@ -45,24 +48,40 @@ class Patent:
 
     @cached_property
     def file_date(self) -> date:
-        date_str =  self.node.xpath('//div[@class="meta"]/div[@class="date-filed"]/text()[last()]')[0]
+        date_str =  self.node.xpath('.//div[@class="meta"]/div[@class="date-filed"]/text()[last()]')[0]
         return self.parse_date(date_str)
 
 
     @cached_property
     def issued_date(self) -> date:
-        date_str =  self.node.xpath('//div[@class="meta"]/div[@class="date-issued"]/text()[last()]')[0]
+        date_str =  self.node.xpath('.//div[@class="meta"]/div[@class="date-issued"]/text()[last()]')[0]
         return self.parse_date(date_str)
 
 
     @cached_property
     def assignees(self) -> str:
-        assignee = self.node.xpath('//div[@class="meta"]/div[@class="assignees"]/text()[last()]')[0]
+        assignee = self.node.xpath('.//div[@class="meta"]/div[@class="assignees"]/text()[last()]')[0]
         return assignee.strip()
 
     @property
     def owner(self) -> str:
         return self.assignees
+
+def get_page_content(company: str, page: int, session) -> str:
+    url = f"https://patents.justia.com/assignee/{company}?page={page}"
+
+    cache = Path(f"cache/{company}_{page}.html")
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    if cache.exists():
+        return cache.read_text()
+
+    with console.status(f"Fetching page {page}..."):
+        response = session.get(url)
+
+    assert response.status_code==200, f"Failed to get patents from {url}"
+    cache.write_text(response.text)
+
+    return response.text
 
 def get_all_patents(company: str, session=None) -> Iterator[Patent]:
     if not session:
@@ -73,13 +92,10 @@ def get_all_patents(company: str, session=None) -> Iterator[Patent]:
     base_url = "https://patents.justia.com"
 
     while True:
-        url = f"https://patents.justia.com/assignee/{company}?page={page}"
-        response = session.get(url)
-        assert response.status_code==200, f"Failed to get patents from {url}"
-        tree = etree.HTML(response.text)
-
+        tree = etree.HTML(get_page_content(company, page, session))
         patent_nodes = tree.xpath('//li[@class="has-padding-content-block-30 -zb"]')
         patents = [Patent(node, base_url=base_url, session=session) for node in patent_nodes]
+        # import pdb; pdb.set_trace()
         yield from patents
 
         next_btn = tree.xpath('//span[@class="pagination page"]/a[text()="next"]')
