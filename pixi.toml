@@ -1,0 +1,14 @@
+[project]
+authors = ["ken <1610057945@qq.com>"]
+channels = ["conda-forge"]
+description = "Add a short description here"
+name = "Meta Project"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+requests = ">=2.32.3,<3"
+lxml = ">=5.3.0,<6"
+rich = ">=13.9.4,<14"
