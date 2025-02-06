@@ -5,19 +5,24 @@ For example usage, see the __main__ block at the end of the file.
 """
 from lxml import etree
 import requests
+from requests.adapters import HTTPAdapter, Retry
 from functools import cached_property
-from typing import Optional, List, Tuple, Iterator, Dict, ClassVar
+from typing import Optional, List, Tuple, Iterator, Dict, ClassVar, Iterable
 from datetime import datetime, date
 from email import header
+from pathlib import Path
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+import gc
+
 from rich import traceback
 traceback.install(show_locals=True)
 from rich.console import Console
 console = Console()
-from pathlib import Path
-from dataclasses import dataclass, field
 
 @dataclass
 class Patent:
+    use_patent_pool: ClassVar[bool] = False
     patent_pool: ClassVar[Dict[str, "Patent"]] = {}
 
     @staticmethod
@@ -37,7 +42,7 @@ class Patent:
 
 
     @classmethod
-    def from_summary(cls, node, base_url: str = "https://patents.justia.com", session: requests.Session = requests.Session()) -> "Patent":
+    def from_summary(cls, node, session: requests.Session, base_url: str = "https://patents.justia.com") -> "Patent":
         title = node.xpath('.//div[@class="head"]//a/text()')[0]
         patent_id = node.xpath('.//div[@class="head"]//a/@href')[0].split("/")[-1]
         abstract = (node.xpath('.//div[@class="meta"]/div[@class="abstract"]/text()[last()]') or [None])[0]
@@ -46,7 +51,7 @@ class Patent:
         assignees_matched = node.xpath('.//div[@class="meta"]/div[@class="assignees"]/text()[last()]')
         assignees = assignees_matched[0].strip() if assignees_matched else None
 
-        if patent_id in cls.patent_pool:
+        if cls.use_patent_pool and patent_id in cls.patent_pool:
             return cls.patent_pool[patent_id]
 
         result = cls(
@@ -59,23 +64,28 @@ class Patent:
             session=session,
             _detail_page=None
         )
-        cls.patent_pool[patent_id] = result
+        if cls.use_patent_pool: cls.patent_pool[patent_id] = result
 
         return result
 
     @classmethod
-    def from_patent_id(cls, patent_id: str, session=requests.Session()) -> "Patent":
-        if patent_id in cls.patent_pool:
+    def from_patent_id(cls, patent_id: str, session: requests.Session) -> "Optional[Patent]":
+        if cls.use_patent_pool and patent_id in cls.patent_pool:
             return cls.patent_pool[patent_id]
 
-        page = etree.HTML(get_patent_detail(patent_id, session))
-        title = page.xpath('//h1[@class="heading-1"]//text()')[0]
+        page_str = get_patent_detail(patent_id, session)
+        if page_str is None: return None
+
+        page = etree.HTML(page_str)
+        title = (page.xpath('//h1[@class="heading-1"]//text()') + [""])[0]
         abstract = (page.xpath('//div[@id="abstract"]/p/text()') + [None])[0]
-        file_date = cls.parse_date(page.xpath('//div[@id="history"]//strong[text()="Filed"]/following-sibling::text()[1]')[0][2:])
+        file_date_matched = page.xpath('//div[@id="history"]//strong[text()="Filed"]/following-sibling::text()[1]')
+        file_date = cls.parse_date(file_date_matched[0][2:] if len(file_date_matched)>0 else "Jan 1, 1997")
         issued_date = cls.parse_date(
             (
                 page.xpath('//div[@id="history"]//strong[text()="Date of Patent"]/following-sibling::text()[1]') +
-                page.xpath('//div[@id="history"]//strong[text()="Publication Date"]/following-sibling::text()[1]')
+                page.xpath('//div[@id="history"]//strong[text()="Publication Date"]/following-sibling::text()[1]') +
+                [": Jan 1, 1997"]
             )[0][2:]
         )
         assignees_matched = page.xpath('//div[@id="history"]//strong[text()="Assignee"]/following-sibling::a[1]/text()')
@@ -89,9 +99,9 @@ class Patent:
             issued_date=issued_date,
             assignees=assignees,
             session=session,
-            _detail_page=page
+            _detail_page=page_str
         )
-        cls.patent_pool[patent_id] = result
+        if cls.use_patent_pool: cls.patent_pool[patent_id] = result
 
         return result
 
@@ -105,23 +115,35 @@ class Patent:
     _detail_page: Optional[str]
 
     @property
-    def detail_page(self) -> str:
+    def detail_page(self) -> Optional[str]:
         if self._detail_page is None:
             self._detail_page = get_patent_detail(self.patent_id, self.session)
 
         return self._detail_page
 
     @property
-    def citations(self) -> List["Patent"]:
+    def citations(self) -> Iterable["Patent"]:
+        if self.detail_page is None: return []
+
         page = etree.HTML(self.detail_page)
         patent_ids: List[str] = page.xpath('//div[@id="citations"]//tr/td[1]/a[1]/text()')
-        return [Patent.from_patent_id(patent_id, session=self.session) for patent_id in patent_ids]
+
+        def fetch_patent(id):
+            return Patent.from_patent_id(id, session=self.session)
+
+        with ThreadPoolExecutor(max_workers=80) as executor:
+            result: List[Optional[Patent]] = list(executor.map(fetch_patent, patent_ids))
+
+        result_nonone: List[Patent] = [x for x in result if x is not None]
+        return result_nonone
+
+        # for patent_id in patent_ids:
+        #     yield Patent.from_patent_id(patent_id, session=self.session)
 
     def __rich_repr__(self):
         yield self.title
         yield "Patent ID", self.patent_id
         yield "Abstract", self.abstract
-        yield "Citations", len(self.citations)
 
 def get_page_content(company: str, page: int, session) -> str:
     url = f"https://patents.justia.com/assignee/{company}?page={page}"
@@ -131,15 +153,16 @@ def get_page_content(company: str, page: int, session) -> str:
     if cache.exists():
         return cache.read_text()
 
-    with console.status(f"Fetching page {page}..."):
-        response = session.get(url)
+    # with console.status(f"Fetching page {page}..."):
+    print(f"Fetching page {page}...")
+    response = session.get(url)
 
     assert response.status_code==200, f"Failed to get patents from {url}"
     cache.write_text(response.text)
 
     return response.text
 
-def get_patent_detail(id: str, session) -> str:
+def get_patent_detail(id: str, session) -> Optional[str]:
     url = f"https://patents.justia.com/patent/{id}"
 
     cache = Path(f"cache/detail_{id}.html")
@@ -147,18 +170,26 @@ def get_patent_detail(id: str, session) -> str:
     if cache.exists():
         return cache.read_text()
 
-    with console.status(f"Fetching patent #{id}..."):
-        response = session.get(url)
+    # with console.status(f"Fetching patent #{id}..."):
+    print(f"Fetching patent #{id}...")
+    response = session.get(url)
 
-    assert response.status_code==200, f"Failed to get patents from {url}"
+    if response.status_code!=200: return None
+
     cache.write_text(response.text)
-
     return response.text
 
-def get_all_patents(company: str, session=None) -> Iterator[Patent]:
-    if not session:
-        session = requests.Session()
-        session.headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:134.0) Gecko/20100101 Firefox/134.0"
+def get_default_session() -> requests.Session:
+    session = requests.Session()
+    session.headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:134.0) Gecko/20100101 Firefox/134.0"
+
+    retries = Retry(total=5, backoff_factor=0.1, status_forcelist=[ 500, 502, 503, 504 ])
+    session.mount('http://', HTTPAdapter(max_retries=retries))
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+
+    return session
+
+def get_all_patents(company: str, session=get_default_session()) -> Iterator[Patent]:
 
     page = 1
     base_url = "https://patents.justia.com"
@@ -167,14 +198,19 @@ def get_all_patents(company: str, session=None) -> Iterator[Patent]:
         tree = etree.HTML(get_page_content(company, page, session))
         patent_nodes = tree.xpath('//li[@class="has-padding-content-block-30 -zb"]')
 
-        patents = [Patent.from_summary(node, base_url=base_url, session=session) for node in patent_nodes]
-        yield from patents
+        patents = [Patent.from_summary(node, session=session, base_url=base_url) for node in patent_nodes]
+        # yield from patents
+
+        while len(patents) > 0:
+            yield patents.pop()
 
         next_btn = tree.xpath('//span[@class="pagination page"]/a[text()="next"]')
         if len(next_btn) > 0:
             page += 1
         else:
             break
+
+
 
 if __name__=='__main__':
     from rich import print

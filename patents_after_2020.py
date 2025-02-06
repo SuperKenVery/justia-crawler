@@ -21,4 +21,5 @@ def main(company: str):
 
 meta = "meta-platforms-inc"
 openai = "openai-opco-llc"
-main(openai)
+anthropic = "anthropics-technology-limited"
+main(anthropic)
